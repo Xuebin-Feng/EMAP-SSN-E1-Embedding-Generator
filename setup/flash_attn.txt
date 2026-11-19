@@ -1,0 +1,4 @@
+# Installed by start.sh after setup/requirements.txt, without build isolation: flash-attn's
+# setup script imports the installed torch and downloads the matching prebuilt wheel from the
+# flash-attention GitHub releases (compiling it instead would need nvcc and hours).
+flash-attn==2.8.3.post1

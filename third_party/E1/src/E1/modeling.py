@@ -1,3 +1,5 @@
+# Changed for EMAP-SSN-E1-Embedding-Generator (2026); this is not the upstream Profluent-E1 file.
+# Upstream: https://github.com/Profluent-AI/E1 at bfd2620. What changed: third_party/E1/MODIFICATIONS.md.
 """PyTorch E1 model."""
 
 import os
@@ -6,24 +8,73 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from kernels import get_kernel
 from transformers.modeling_outputs import ModelOutput
 from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import logging
 
 from .config import E1Config
 from .dynamic_cache import DynamicCache
-from .model.attention import Attention, AttentionArgs
-from .model.ffn import FFN
-from .model.flex_attention import FlexAttentionArgs, create_block_causal_mask_optimized
+from .model import bf16_options
+from .model.attention import Attention, AttentionArgs, AttentionLayerType
+from .model.ffn import FFN, GLUMLP
+from .model.flash_attention_utils import get_varlen_metadata
+from .model.flex_attention import (
+    HAS_BLOCK_BOUNDS_MASK,
+    FlexAttentionArgs,
+    create_block_causal_mask_from_block_bounds,
+    create_block_causal_mask_optimized,
+)
 
 logger = logging.get_logger(__name__)
 
+# RMSNorm kernel. Upstream fetches it from the Hugging Face Hub on every run, unpinned
+# (get_kernel("kernels-community/triton-layer-norm")), and that repository is due to be
+# removed. This fork bundles the same files, byte for byte, in model/triton_layer_norm
+# (BSD-3-Clause, from flash-attention; see PROVENANCE.md there) and loads that copy. The Hub
+# is tried only when the bundled copy cannot be imported, and PyTorch's RMSNorm is the last
+# resort, as upstream. Only one copy can load per process: both register the same op names.
 try:
-    layer_norm = get_kernel("kernels-community/triton-layer-norm")
-except Exception as e:
-    logger.warning(f"Failed to load triton layer norm kernel: {e}; Will be using PyTorch RMSNorm instead")
-    layer_norm = None
+    from .model import triton_layer_norm as layer_norm
+except Exception as e:  # noqa: BLE001
+    logger.warning(f"Failed to import the bundled triton layer norm kernel: {e}; trying the Hugging Face Hub")
+    try:
+        from kernels import get_kernel
+
+        layer_norm = get_kernel("kernels-community/triton-layer-norm")
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"Failed to load triton layer norm kernel: {e}; Will be using PyTorch RMSNorm instead")
+        layer_norm = None
+
+
+def pin_rmsnorm_num_warps(num_warps=None):
+    """Fix the warp count of the Triton RMSNorm kernel instead of autotuning it.
+
+    The Triton kernel behind `layer_norm.rms_norm_fn` is autotuned: on first use in each
+    process it times num_warps 1-32 on the live GPU and keeps the fastest. Each warp count
+    sums the squares in a different order, so when two counts are nearly tied, separate
+    runs of the same code can produce slightly different embeddings. Setting
+    E1_RMSNORM_NUM_WARPS (or passing num_warps) makes every run use one warp count.
+    Unset, the kernel autotunes exactly as before. Returns the warp count in force, or None.
+    """
+    if num_warps is None:
+        num_warps = os.environ.get("E1_RMSNORM_NUM_WARPS") or None
+    if num_warps is None or layer_norm is None:
+        return None
+    import importlib
+
+    kernel = importlib.import_module(layer_norm.__name__ + ".layer_norm")._layer_norm_fwd_1pass_kernel
+    if not hasattr(kernel, "_e1_all_configs"):
+        kernel._e1_all_configs = list(kernel.configs)
+    chosen = [c for c in kernel._e1_all_configs if c.num_warps == int(num_warps)]
+    if not chosen:
+        raise ValueError(f"E1_RMSNORM_NUM_WARPS={num_warps}: not one of "
+                         f"{[c.num_warps for c in kernel._e1_all_configs]}")
+    kernel.configs = chosen  # a single config: Triton skips the benchmark
+    kernel.cache.clear()
+    return int(num_warps)
+
+
+RMSNORM_NUM_WARPS = pin_rmsnorm_num_warps()
 
 
 @dataclass
@@ -96,6 +147,24 @@ class RMSNorm(nn.Module):
                 prenorm=False,
                 residual_in_fp32=False,
             ).to(input_dtype)
+
+    def add_and_norm(self, x: torch.Tensor, residual: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """FUSED_ADD_NORM: returns (rms_norm(x + residual), x + residual) from one kernel.
+
+        The sum is normalised in fp32 before rounding (eager rounds it to bf16 first), so
+        this differs from norm(residual + x) at bf16 rounding level.
+        """
+        out, residual_out = layer_norm.rms_norm_fn(
+            x=x,
+            weight=self.weight,
+            bias=None,
+            residual=residual,
+            eps=self.variance_epsilon,
+            dropout_p=0.0,
+            prenorm=True,
+            residual_in_fp32=False,
+        )
+        return out.to(x.dtype), residual_out
 
 
 class NormAttentionNorm(nn.Module):
@@ -239,6 +308,7 @@ class E1Model(E1PreTrainedModel):
         use_cache: bool = False,
         output_attentions: bool = False,
         output_hidden_states: bool = False,
+        keep_rows: torch.LongTensor | None = None,
     ) -> E1ModelOutputWithPast:
         """
         Args:
@@ -259,6 +329,9 @@ class E1Model(E1PreTrainedModel):
             use_cache: bool
             output_attentions: bool
             output_hidden_states: bool
+            keep_rows: (n,) token indices of the LAST sequence to return (batch size 1 only).
+                With bf16_options.QUERY_ONLY_LAST_LAYER the last layer is computed only for
+                these rows and last_hidden_state has shape (1, n, hidden_size).
 
         Returns:
             E1ModelOutputWithPast: Model Outputs
@@ -282,8 +355,17 @@ class E1Model(E1PreTrainedModel):
         within_seq_position_ids = within_seq_position_ids.view(-1, seq_length).long()
         sequence_ids = sequence_ids.view(-1, seq_length).long()
 
-        max_position_id = torch.max(within_seq_position_ids).item()
-        min_position_id = torch.min(within_seq_position_ids).item()
+        # One host sync for every data-dependent value this forward needs. The original synced
+        # here, again in RoPE in every layer and in unpadding in every within-sequence layer,
+        # each time leaving the GPU idle while the CPU caught up.
+        max_position_id, min_position_id, max_global_position_id, num_padding = torch.stack(
+            [
+                within_seq_position_ids.max(),
+                within_seq_position_ids.min(),
+                global_position_ids.max(),
+                (sequence_ids == -1).sum(),
+            ]
+        ).tolist()
         assert max_position_id < self.config.max_num_positions_within_seq and min_position_id >= -1, (
             f"Position ids must be in the range [-1, {self.config.max_num_positions_within_seq}); got max {max_position_id} and min {min_position_id}"
         )
@@ -305,9 +387,46 @@ class E1Model(E1PreTrainedModel):
         # Create block mask for flex attention
         attention_args: AttentionArgs | None = None
         if past_key_values_length == 0:
-            block_mask = create_block_causal_mask_optimized(sequence_ids)
+            if num_padding == 0 and HAS_BLOCK_BOUNDS_MASK:
+                block_mask = create_block_causal_mask_from_block_bounds(sequence_ids)
+            else:
+                block_mask = create_block_causal_mask_optimized(sequence_ids)
             flex_attention_args = FlexAttentionArgs(block_mask=block_mask)
-            attention_args = AttentionArgs(flex_attention_args=flex_attention_args)
+            attention_args = AttentionArgs(
+                flex_attention_args=flex_attention_args,
+                varlen=get_varlen_metadata(sequence_ids, has_padding=num_padding > 0),
+                rope_seq_len={
+                    AttentionLayerType.WITHIN_SEQ: max_position_id + 1,
+                    AttentionLayerType.GLOBAL: max_global_position_id + 1,
+                },
+                rope_cache={},
+            )
+
+        phase2 = (
+            attention_args is not None
+            and not use_cache
+            and not output_hidden_states
+            and not output_attentions
+            and not (self.gradient_checkpointing and self.training)
+            and (bf16_options.FUSED_ADD_NORM and layer_norm is not None or keep_rows is not None)
+        )
+        if phase2:
+            rows_ok = (
+                keep_rows is not None
+                and bf16_options.QUERY_ONLY_LAST_LAYER
+                and batch_size == 1
+                and num_padding == 0
+                and self.layers[-1].norm_attn_norm.self_attn.layer_type == AttentionLayerType.GLOBAL
+            )
+            hidden_states = self._forward_phase2(
+                hidden_states,
+                within_seq_position_ids,
+                global_position_ids,
+                sequence_ids,
+                attention_args,
+                keep_rows if rows_ok else None,
+            )
+            return E1ModelOutputWithPast(last_hidden_state=hidden_states)
 
         # decoder layers
         all_hidden_states = () if output_hidden_states else None
@@ -367,6 +486,73 @@ class E1Model(E1PreTrainedModel):
             hidden_states=all_hidden_states,
             attentions=all_self_attns,
         )
+
+    def _forward_phase2(
+        self,
+        hidden_states: torch.Tensor,
+        within_seq_position_ids: torch.LongTensor,
+        global_position_ids: torch.LongTensor,
+        sequence_ids: torch.LongTensor,
+        attention_args: AttentionArgs,
+        keep_rows: torch.LongTensor | None,
+    ) -> torch.Tensor:
+        """Decoder stack for inference with the phase-2 options (bf16_options).
+
+        The true hidden state is residual + delta; the add is deferred so it can be fused
+        into the next RMSNorm (FUSED_ADD_NORM). With FUSED_ADD_NORM off and keep_rows None
+        this performs exactly the upstream operations in the upstream order.
+        """
+        fuse = bf16_options.FUSED_ADD_NORM and layer_norm is not None
+        residual, delta = hidden_states, None
+        last = len(self.layers) - 1
+        for i, layer in enumerate(self.layers):
+            block = layer.norm_attn_norm
+            if delta is None:
+                h = block.input_layernorm(residual)
+            elif fuse:
+                h, residual = block.input_layernorm.add_and_norm(delta, residual)
+            else:
+                residual = residual + delta
+                h = block.input_layernorm(residual)
+            if i == last and keep_rows is not None:
+                attn_out = block.self_attn.forward_rows(h, keep_rows, global_position_ids, attention_args)
+                residual = residual[:, keep_rows]
+            else:
+                attn_out, _, _ = block.self_attn(
+                    hidden_states=h,
+                    within_seq_position_ids=within_seq_position_ids,
+                    global_position_ids=global_position_ids,
+                    sequence_ids=sequence_ids,
+                    attention_args=attention_args,
+                )
+            if fuse:
+                h, residual = block.post_attention_layernorm.add_and_norm(attn_out, residual)
+            else:
+                residual = residual + attn_out
+                h = block.post_attention_layernorm(residual)
+            delta = layer.ffn(h)
+        if fuse:
+            return self.norm.add_and_norm(delta, residual)[0]
+        return self.norm(residual + delta)
+
+
+def merge_projection_weights(model: nn.Module) -> None:
+    """MERGED_GEMMS: store q/k/v and w1/w3 weights as one tensor each per layer; the
+    original Linear weights become views of it (no extra memory). Call after any dtype cast."""
+    for module in model.modules():
+        if isinstance(module, Attention):
+            qkv = torch.cat([module.q_proj.weight, module.k_proj.weight, module.v_proj.weight]).contiguous()
+            n_q, n_k = module.q_proj.weight.shape[0], module.k_proj.weight.shape[0]
+            module.q_proj.weight = nn.Parameter(qkv[:n_q], requires_grad=False)
+            module.k_proj.weight = nn.Parameter(qkv[n_q : n_q + n_k], requires_grad=False)
+            module.v_proj.weight = nn.Parameter(qkv[n_q + n_k :], requires_grad=False)
+            module.qkv_weight = qkv
+        elif isinstance(module, GLUMLP):
+            w13 = torch.cat([module.w1.weight, module.w3.weight]).contiguous()
+            n = module.w1.weight.shape[0]
+            module.w1.weight = nn.Parameter(w13[:n], requires_grad=False)
+            module.w3.weight = nn.Parameter(w13[n:], requires_grad=False)
+            module.w13_weight = w13
 
 
 class E1ForMaskedLM(E1PreTrainedModel):

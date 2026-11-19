@@ -1,5 +1,7 @@
 # Adapted from https://github.com/Dao-AILab/flash-attention/blob/main/flash_attn/bert_padding.py
 # Code in this file is licensed under BSD-3-Clause license.
+# Changed for EMAP-SSN-E1-Embedding-Generator (2026); this is not the upstream Profluent-E1 file.
+# Upstream: https://github.com/Profluent-AI/E1 at bfd2620. What changed: third_party/E1/MODIFICATIONS.md.
 
 import torch
 import torch.nn.functional as F
@@ -86,6 +88,16 @@ def _get_unpad_data(sequence_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Ten
     max_seqlen_in_batch = seqlens_in_batch.max().item()
     cu_seqlens = F.pad(torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.torch.int32), (1, 0))
     return non_pad_indices, cu_seqlens, max_seqlen_in_batch
+
+
+def get_varlen_metadata(sequence_ids: torch.Tensor, has_padding: bool) -> dict:
+    """Unpadding data for all within-sequence layers of one forward pass, computed once.
+
+    The original recomputed this (with three host syncs) in each of the 20 layers. Without
+    padding, unpadding is the identity, so indices is None and callers only reshape.
+    """
+    indices, cu_seqlens, max_seqlen = _get_unpad_data(sequence_ids)
+    return {"indices": indices if has_padding else None, "cu_seqlens": cu_seqlens, "max_seqlen": max_seqlen}
 
 
 def _unpad_input(

@@ -1,0 +1,13 @@
+EMAP-SSN-E1-Embedding-Generator: Profluent-E1 embedding generation for EMAP-SSN
+Copyright 2026 Xuebin Feng
+Author affiliation: University of Toronto
+
+This project builds upon Profluent-E1 under the terms of the Profluent-E1 Clickthrough
+License Agreement. third_party/E1 contains Profluent-E1 (https://github.com/Profluent-AI/E1,
+Copyright 2025 Profluent Bio Inc.) with changes listed in third_party/E1/MODIFICATIONS.md;
+its LICENSE, NOTICE and ATTRIBUTION files apply to that folder.
+
+third_party/E1/src/E1/model/triton_layer_norm and
+third_party/E1/src/E1/model/flash_attention_utils.py contain code from flash-attention
+(https://github.com/Dao-AILab/flash-attention), BSD 3-Clause License; see
+third_party/E1/src/E1/model/triton_layer_norm/LICENSE.

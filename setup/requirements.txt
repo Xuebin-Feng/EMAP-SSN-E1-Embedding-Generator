@@ -1,0 +1,38 @@
+# Packages start.sh installs into .venv (Python 3.12, Linux x86_64 with an NVIDIA GPU).
+# Versions are pinned to the environment the published embeddings were checked with;
+# setup/constraints.txt pins everything they pull in as well. Bit-for-bit results depend
+# on torch, triton and flash-attn in particular: change them only on purpose.
+#
+# flash-attn is installed in a second step (setup/flash_attn.txt): its setup script needs
+# torch installed first, then downloads the prebuilt wheel for this torch and CUDA.
+
+# Deep learning stack (torch 2.8.0 from PyPI is the CUDA 12.8 build)
+torch==2.8.0
+triton==3.4.0
+transformers==4.56.2
+tokenizers==0.22.2
+safetensors==0.8.0
+huggingface_hub==0.36.2
+einops==0.8.2
+# Not installed on purpose: kernels. Upstream E1 fetches its RMSNorm kernel with it from the
+# Hugging Face Hub; third_party/E1 bundles that kernel instead (E1/model/triton_layer_norm),
+# so the Hub copy, which may change or disappear, is never used.
+
+# The drivers
+numpy==2.5.0
+scipy==1.18.0
+scikit-learn==1.9.0
+h5py==3.16.0
+tqdm==4.68.3
+
+# Other runtime dependencies of Profluent-E1 (third_party/E1 is installed with --no-deps)
+pandas==3.0.3
+polars==1.42.0
+biotite==1.7.1
+click==8.4.2
+psutil==7.2.2
+
+# Needed to install flash-attn without build isolation
+setuptools==82.0.1
+wheel==0.47.0
+packaging==26.2

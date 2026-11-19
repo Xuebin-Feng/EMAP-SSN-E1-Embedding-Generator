@@ -1,12 +1,17 @@
+# Changed for EMAP-SSN-E1-Embedding-Generator (2026); this is not the upstream Profluent-E1 file.
+# Upstream: https://github.com/Profluent-AI/E1 at bfd2620. What changed: third_party/E1/MODIFICATIONS.md.
 from enum import Enum
 from typing import TypedDict
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from transformers.utils import logging
 
 from ..config import E1Config
 from ..dynamic_cache import DynamicCache
+from . import bf16_options, fused_ops
+from .flash_attention import flash_attn_func
 from .flash_attention import flash_attention_func, is_flash_attention_available
 from .flex_attention import FlexAttentionArgs, flex_attention_func
 from .varlen_flex_attention import varlen_flex_attention_func
@@ -26,6 +31,10 @@ class AttentionLayerType(Enum):
 
 class AttentionArgs(TypedDict, total=False):
     flex_attention_args: FlexAttentionArgs
+    # Per-forward values shared by all layers (set by E1Model.forward when no KV cache is used):
+    varlen: dict  # unpadding data for within-sequence flash attention (get_varlen_metadata)
+    rope_seq_len: dict  # AttentionLayerType -> max position id + 1
+    rope_cache: dict  # AttentionLayerType -> (cos, sin), filled by the first layer of each type
 
 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -72,11 +81,9 @@ class RotaryPositionalEmbedding(nn.Module):
         self.register_buffer("cos_cached", angles.cos(), persistent=False)
         self.register_buffer("sin_cached", angles.sin(), persistent=False)
 
-    def forward(
-        self, q: torch.Tensor, k: torch.Tensor, position_ids: torch.LongTensor, seq_len: int | None = None
+    def cos_sin(
+        self, position_ids: torch.LongTensor, device: torch.device, dtype: torch.dtype, seq_len: int | None = None
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        # x: [bsz, seq_len, num_attention_heads, head_size]
-        device, dtype = q.device, q.dtype
         seq_len = position_ids.max().item() + 1 if seq_len is None else seq_len
 
         if seq_len > self.max_seq_len_cached:
@@ -87,13 +94,24 @@ class RotaryPositionalEmbedding(nn.Module):
         idxs = position_ids.to(device)
         cos = self.cos_cached.to(device=device, dtype=dtype).unsqueeze(-2)[idxs]
         sin = self.sin_cached.to(device=device, dtype=dtype).unsqueeze(-2)[idxs]
+        return cos, sin
 
+    def apply(
+        self, q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         # Apply rotary positional embeddings to q and k (treating them as complex numbers). The first half is
         # Re[x exp(it)] = Re[x] cos(t) - Im[x] sin(t), while the second half is
         # Im[x exp(it)] = Im[x] cos(t) + Re[x] sin(t). This works b/c both halves of cos/sin are the same.
         q_embed = (q * cos) + (self.rotate_half(q) * sin)
         k_embed = (k * cos) + (self.rotate_half(k) * sin)
         return q_embed, k_embed
+
+    def forward(
+        self, q: torch.Tensor, k: torch.Tensor, position_ids: torch.LongTensor, seq_len: int | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # x: [bsz, seq_len, num_attention_heads, head_size]
+        cos, sin = self.cos_sin(position_ids, q.device, q.dtype, seq_len)
+        return self.apply(q, k, cos, sin)
 
 
 class Attention(nn.Module):
@@ -145,6 +163,41 @@ class Attention(nn.Module):
         self.rotary_emb = RotaryPositionalEmbedding(
             self.head_dim, max_position_embeddings=self.max_position_embeddings, base=self.rope_theta
         )
+        self.qkv_weight: torch.Tensor | None = None  # set by merge_projection_weights (MERGED_GEMMS)
+
+    def forward_rows(
+        self,
+        hidden_states: torch.Tensor,
+        rows: torch.LongTensor,
+        global_position_ids: torch.LongTensor,
+        attention_args: AttentionArgs,
+    ) -> torch.Tensor:
+        """QUERY_ONLY_LAST_LAYER: output of this GLOBAL layer's attention for `rows` only.
+
+        rows belong to the last sequence, which under the block-causal mask attends to
+        every token, so keys/values come from all tokens and attention is full (flash).
+        hidden_states: (1, N, C) after the input norm. Returns (1, len(rows), C).
+        """
+        assert self.layer_type == AttentionLayerType.GLOBAL and hidden_states.shape[0] == 1
+        n_rows, n_tok = rows.shape[0], hidden_states.shape[1]
+        q = self.q_proj(hidden_states[:, rows]).view(1, n_rows, self.num_heads, self.head_dim)
+        k = self.k_proj(hidden_states).view(1, n_tok, self.num_kv_heads, self.head_dim)
+        v = self.v_proj(hidden_states).view(1, n_tok, self.num_kv_heads, self.head_dim)
+        if self.clip_qkv is not None:
+            q = q.clamp(-self.clip_qkv, self.clip_qkv)
+            k = k.clamp(-self.clip_qkv, self.clip_qkv)
+            v = v.clamp(-self.clip_qkv, self.clip_qkv)
+        cache = attention_args["rope_cache"]
+        if self.layer_type not in cache:
+            cache[self.layer_type] = self.rotary_emb.cos_sin(
+                global_position_ids, q.device, q.dtype, attention_args["rope_seq_len"][self.layer_type]
+            )
+        cos, sin = cache[self.layer_type]
+        rotate_half = self.rotary_emb.rotate_half
+        q = (q * cos[:, rows]) + (rotate_half(q) * sin[:, rows])
+        k = (k * cos) + (rotate_half(k) * sin)
+        out = flash_attn_func(q, k, v, causal=False)
+        return self.o_proj(out.reshape(1, n_rows, self.hidden_size))
 
     def prepare_qkv(
         self,
@@ -152,11 +205,44 @@ class Attention(nn.Module):
         position_ids: torch.LongTensor,
         past_key_value: DynamicCache | None = None,
         use_cache: bool = False,
+        attention_args: AttentionArgs | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         bsz, q_len, _ = hidden_states.size()
-        query_states: torch.Tensor = self.q_proj(hidden_states)
-        key_states: torch.Tensor = self.k_proj(hidden_states)
-        val_states: torch.Tensor = self.v_proj(hidden_states)
+        if bf16_options.MERGED_GEMMS and self.qkv_weight is not None:
+            qkv = F.linear(hidden_states, self.qkv_weight)  # one GEMM; q/k/v are column views
+            n_q, n_kv = self.num_heads * self.head_dim, self.num_kv_heads * self.head_dim
+            query_states, key_states, val_states = qkv[..., :n_q], qkv[..., n_q : n_q + n_kv], qkv[..., n_q + n_kv :]
+        else:
+            query_states = self.q_proj(hidden_states)
+            key_states = self.k_proj(hidden_states)
+            val_states = self.v_proj(hidden_states)
+
+        rope_cache = attention_args.get("rope_cache") if attention_args is not None else None
+        if rope_cache is not None:
+            # All layers of one type share theta and table size, so the gathered cos/sin
+            # are identical across them: the first layer of each type computes them for
+            # this forward and the others reuse them (no per-layer .item() or table cast).
+            if self.layer_type not in rope_cache:
+                rope_cache[self.layer_type] = self.rotary_emb.cos_sin(
+                    position_ids,
+                    query_states.device,
+                    query_states.dtype,
+                    attention_args["rope_seq_len"][self.layer_type],
+                )
+            cos, sin = rope_cache[self.layer_type]
+            if not use_cache and fused_ops.rope_qkv_supported(query_states, key_states, val_states, cos):
+                # One kernel for clamp + RoPE (same bf16 rounding as the eager ops below);
+                # global layers get q/k/v directly in flex attention's (B, H, N, D) layout.
+                return fused_ops.rope_qkv(
+                    query_states,
+                    key_states,
+                    val_states,
+                    cos,
+                    sin,
+                    self.clip_qkv,
+                    self.head_dim,
+                    heads_first=self.layer_type == AttentionLayerType.GLOBAL,
+                )
 
         query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim)
         key_states = key_states.view(bsz, q_len, self.num_kv_heads, self.head_dim)
@@ -167,7 +253,10 @@ class Attention(nn.Module):
             key_states = key_states.clamp(-self.clip_qkv, self.clip_qkv)
             val_states = val_states.clamp(-self.clip_qkv, self.clip_qkv)
 
-        query_states, key_states = self.rotary_emb(query_states, key_states, position_ids)
+        if rope_cache is not None:
+            query_states, key_states = self.rotary_emb.apply(query_states, key_states, cos, sin)
+        else:
+            query_states, key_states = self.rotary_emb(query_states, key_states, position_ids)
 
         if use_cache and past_key_value is not None:
             key_states, val_states = past_key_value.update(key_states, val_states, self.layer_idx)
@@ -214,6 +303,7 @@ class Attention(nn.Module):
             else global_position_ids,
             past_key_value=past_key_value,
             use_cache=use_cache,
+            attention_args=attention_args,
         )
 
         # Note: We fallback to using flash attention in inference mode when cache is filled with kv values
@@ -296,6 +386,9 @@ class Attention(nn.Module):
                 val_states = val_states[:, -q_len:]
             q_sequence_ids = k_sequence_ids = sequence_ids
 
+        varlen = attention_args.get("varlen") if attention_args is not None else None
+        if varlen is not None and (self.layer_type == AttentionLayerType.GLOBAL or q_len != kv_len):
+            varlen = None  # precomputed data only covers within-sequence layers without a KV cache
         if is_flash_attention_available():
             attn_output = flash_attention_func(
                 query_states,
@@ -304,6 +397,7 @@ class Attention(nn.Module):
                 q_sequence_ids=q_sequence_ids,
                 k_sequence_ids=k_sequence_ids,
                 causal=False,
+                varlen=varlen,
             )
         else:
             attn_output = varlen_flex_attention_func(

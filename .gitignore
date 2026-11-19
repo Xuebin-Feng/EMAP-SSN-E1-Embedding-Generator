@@ -1,0 +1,28 @@
+# --- Data: large inputs/outputs, archived separately (not in git) ---
+/Embeddings/
+/Networks_EValues/
+/Sequence_Sets/
+*.h5
+*.hdf5
+*.npy
+*.npz
+
+# --- Local working clones of Profluent-E1 (not part of this repository) ---
+# The E1 code this repository uses is third_party/E1/ (tracked). These folders are the
+# git clone it was developed in and stay local:
+# E1/   upstream main at bfd2620 (editable install that produced the published embeddings),
+#       with the development branches speedup-exact and speedup-bf16
+# Anchored with "/" so that third_party/E1/ and its src/E1/ are not matched.
+/E1/
+
+# --- benchmarks/: keep the scripts, ignore everything they produce ---
+/benchmarks/*
+!/benchmarks/*.py
+!/benchmarks/*.sh
+!/benchmarks/*.ps1
+!/benchmarks/README.md
+
+# --- Python ---
+/.venv/
+__pycache__/
+*.pyc
