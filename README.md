@@ -51,11 +51,32 @@ which takes about a second, and open the shell.
 | `./start.sh --check-only` | Only reports: exit 0 if ready, 10 if setup is needed. With `--import`, it also imports torch, flash-attn and E1, which uses the GPU. |
 | `./start.sh --setup-only` | Builds or repairs `.venv`, then exits. |
 
-**Requirements:**
-- Linux or WSL2 on x86_64;
-- an NVIDIA GPU with a driver for CUDA 12.8;
-- network access to PyPI, GitHub (the prebuilt flash-attn wheel) and Hugging Face (the E1
-  weights, fetched on first use).
+**Requirements and limitations:**
+- **Operating system: Linux on x86_64, or WSL2 on Windows.** Tested on WSL2 (Ubuntu) on
+  Windows 11. `start.sh` is a bash script and the pinned packages are Linux x86_64 CUDA
+  builds, so it does not install on macOS or on Windows outside WSL2. ARM Linux is untested.
+- **GPU: an NVIDIA GPU of the Ampere generation or newer** (compute capability 8.0 or higher,
+  for example RTX 30 and 40 series, A100, L40, H100), with a driver for CUDA 12.8.
+  flash-attn 2 supports no older GPUs.
+  - Tested on an RTX 4070 (12 GB); a full RA run used at most 3.8 GiB of GPU memory.
+  - Upstream E1 recommends such a GPU, for bf16 and flash attention, and also runs on the
+    CPU. This repository needs the GPU: `start.sh` always installs flash-attn, and E1 then
+    uses it and the Triton RMSNorm kernel without checking where the tensors are.
+  - **`--device cpu` fails on a machine with an NVIDIA GPU** (the Triton RMSNorm kernel gets
+    CPU tensors).
+  - **Without an NVIDIA GPU,** setup and `./start.sh --check-only --import` succeed, but the
+    first embedding fails in flash-attn.
+    - With `USE_FLASH_ATTN=0`, single-sequence (NORM) mode runs on the CPU, at about 2.5 s
+      per sequence of about 300 residues on 4 threads.
+    - RA mode does not run on the CPU in practice: there, the first query needed more than
+      14 GB of RAM.
+    - CPU results are not bit-for-bit identical to the published GPU embeddings.
+- **Memory and disk:**
+  - peak RAM 5.3 GiB for a full RA run;
+  - disk: about 8 GB for `.venv`, 1.2 GB for the E1 weights (in the Hugging Face cache), and
+    about 10 GB for the RA embeddings of the 12,927 sequences.
+- **Network:** PyPI, GitHub (the prebuilt flash-attn wheel) and Hugging Face (the E1 weights,
+  fetched on first use; no login needed).
 
 **Pinned versions:**
 - `setup/requirements.txt` pins the top-level packages, and `setup/constraints.txt` pins
