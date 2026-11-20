@@ -1,7 +1,8 @@
 # --- Data: large inputs/outputs, archived separately (not in git) ---
-/Embeddings/
-/Networks_EValues/
-/Sequence_Sets/
+# No trailing "/", so that symbolic links to data folders elsewhere are ignored too.
+/Embeddings
+/Networks_EValues
+/Sequence_Sets
 *.h5
 *.hdf5
 *.npy

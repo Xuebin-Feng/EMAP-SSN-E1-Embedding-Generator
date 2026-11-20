@@ -17,8 +17,9 @@
 # EMAP-SSN-E1-Embedding-Generator: set up the project's Python environment and work in it.
 #
 #   ./start.sh                  check .venv, build or repair it when needed, then open a shell in it
-#   ./start.sh <command> [...]  the same, but run the command in the environment instead, e.g.
-#                               ./start.sh python Generate_Embeddings_E1_fast.py
+#   ./start.sh <command> [...]  the same, but run the command in the environment instead, in the
+#                               folder start.sh was called from, e.g.
+#                               ./start.sh python Generate_Embeddings_E1_fast.py --data-dir ~/my_data
 #   ./start.sh --check-only     only report: exit 0 when .venv is ready, 10 when setup is needed
 #                               (add --import to also import torch, flash-attn and E1; uses the GPU)
 #   ./start.sh --setup-only     build or repair .venv, then exit
@@ -35,6 +36,9 @@ if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
 fi
 set -u
 
+# A command runs where start.sh was called, so that relative paths in it mean what they say;
+# setup and checks run in the project folder.
+CALLER_DIR=$PWD
 PROJECT_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd) || exit 1
 cd "$PROJECT_ROOT" || exit 1
 VENV=.venv
@@ -130,7 +134,8 @@ e1_enter() {
 
     if [ "$#" -gt 0 ]; then
         # shellcheck disable=SC1091
-        . "$VENV/bin/activate"
+        . "$PROJECT_ROOT/$VENV/bin/activate"
+        cd "$CALLER_DIR" || exit 1
         exec "$@"
     fi
     cat > "$rc" <<'EOF'

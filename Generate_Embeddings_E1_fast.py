@@ -59,11 +59,14 @@ SEQUENCE_SET = "Foldtype_IV_ATAs_13000"
 NETWORK_MODEL_NAME = "esmc_6b"  # Model used to generate the network
 
 # --- Paths ---
-INPUT_FASTA = os.path.join("Sequence_Sets", f"{SEQUENCE_SET}.fasta")
+# Folder holding Sequence_Sets/, Networks_EValues/ and Embeddings/ ("" = the current folder).
+# For a single run, use --data-dir or the E1_DATA_DIR environment variable instead.
+DATA_DIR = ""
+INPUT_FASTA = os.path.join(DATA_DIR, "Sequence_Sets", f"{SEQUENCE_SET}.fasta")
 if "blast" in NETWORK_MODEL_NAME.lower():
-    INPUT_NETWORK_H5 = os.path.join("Networks_EValues", f"{SEQUENCE_SET}_[BLAST]_EValue.h5")
+    INPUT_NETWORK_H5 = os.path.join(DATA_DIR, "Networks_EValues", f"{SEQUENCE_SET}_[BLAST]_EValue.h5")
 else:
-    INPUT_NETWORK_H5 = os.path.join("Networks_EValues", f"{SEQUENCE_SET}_[{NETWORK_MODEL_NAME}]_network.h5")
+    INPUT_NETWORK_H5 = os.path.join(DATA_DIR, "Networks_EValues", f"{SEQUENCE_SET}_[{NETWORK_MODEL_NAME}]_network.h5")
 
 # --- Embedding Generation Parameters ---
 EMBEDDING_MODE = "RA"                  # "NORM" (Single sequence) or "RA" (Retrieval-Augmented)
@@ -75,7 +78,7 @@ E1_MODEL_MAPPINGS = {
 SAVING_MODE = "float16"                # Target precision for HDF5 save
 # Own file name, so this script can never open the published embeddings file
 # ({SEQUENCE_SET}_[E1_{EMBEDDING_MODE}]_embeddings.h5, written by Generate_Embeddings_E1.py).
-OUTPUT_HDF5 = os.path.join("Embeddings", f"{SEQUENCE_SET}_[E1_{EMBEDDING_MODE}]_embeddings_speedup.h5")
+OUTPUT_HDF5 = os.path.join(DATA_DIR, "Embeddings", f"{SEQUENCE_SET}_[E1_{EMBEDDING_MODE}]_embeddings_speedup.h5")
 
 # --- Homolog Search Parameters (For RA Mode) ---
 MAX_SEQ_LENGTH = 4096                  # Filter out overly long sequences
@@ -759,7 +762,7 @@ def extract_homologs():
     if USE_ONLY_EMBEDDINGS:
         print("Using ONLY embedding similarity for homolog selection (ignoring network file).")
         model_name_for_sim = SIMILARITY_MODEL_NAME if SIMILARITY_MODEL_NAME is not None else NETWORK_MODEL_NAME
-        INPUT_EMBED_H5 = os.path.join(os.path.dirname(OUTPUT_HDF5), f"{SEQUENCE_SET}_[{model_name_for_sim}]_embeddings.h5")
+        INPUT_EMBED_H5 = os.path.join(DATA_DIR, "Embeddings", f"{SEQUENCE_SET}_[{model_name_for_sim}]_embeddings.h5")
         if not os.path.exists(INPUT_EMBED_H5):
             sys.exit(f"❌ Error: Embedding-only mode active, but base embedding file not found at: {INPUT_EMBED_H5}\n"
                      f"Please make sure you have generated the embeddings for {model_name_for_sim} first.")
@@ -907,7 +910,7 @@ def extract_homologs():
         if is_sparse and not is_blast:
             print(f"Network is sparse ({len(final_src)} / {int(num_valid * (num_valid - 1) / 2)} edges). Activating hybrid cosine-alignment transformation...")
             model_name_for_sim = SIMILARITY_MODEL_NAME if SIMILARITY_MODEL_NAME is not None else NETWORK_MODEL_NAME
-            INPUT_EMBED_H5 = os.path.join(os.path.dirname(OUTPUT_HDF5), f"{SEQUENCE_SET}_[{model_name_for_sim}]_embeddings.h5")
+            INPUT_EMBED_H5 = os.path.join(DATA_DIR, "Embeddings", f"{SEQUENCE_SET}_[{model_name_for_sim}]_embeddings.h5")
             if not os.path.exists(INPUT_EMBED_H5):
                 sys.exit(f"❌ Error: Sparse network detected, but base embedding file not found at: {INPUT_EMBED_H5}\n"
                          f"Please make sure you have generated the embeddings for {model_name_for_sim} first.")
@@ -1505,25 +1508,29 @@ def generate_embeddings(
 # ==========================================
 def parse_args(argv=None):
     """Command-line options. Every default is the CONFIGURATION constant at the top of this
-    file, so running the script without options does exactly what it did before."""
+    file, so running the script without options (and without E1_DATA_DIR set) does exactly
+    what it did before."""
     import argparse
 
     ap = argparse.ArgumentParser(
         description="Generate Profluent-E1 (E1-600m) per-residue embeddings for a sequence set, "
-                    "in retrieval-augmented (RA) or single-sequence (NORM) mode. Paths are relative "
-                    "to the current folder (start.sh runs from the project folder). An unfinished "
-                    "output file is resumed.")
+                    "in retrieval-augmented (RA) or single-sequence (NORM) mode. The default input "
+                    "and output paths are built under --data-dir; paths given with --fasta, "
+                    "--network and --out are used as given. An unfinished output file is resumed.")
     io = ap.add_argument_group("input and output")
+    io.add_argument("--data-dir", default=os.environ.get("E1_DATA_DIR", DATA_DIR),
+                    help="folder holding Sequence_Sets/, Networks_EValues/ and Embeddings/ "
+                         "(default: $E1_DATA_DIR if set, else the current folder)")
     io.add_argument("--sequence-set", default=SEQUENCE_SET,
                     help="name that the default paths below are built from (default: %(default)s)")
-    io.add_argument("--fasta", help="input FASTA (default: Sequence_Sets/<sequence set>.fasta)")
+    io.add_argument("--fasta", help="input FASTA (default: <data dir>/Sequence_Sets/<sequence set>.fasta)")
     io.add_argument("--network-model", default=NETWORK_MODEL_NAME,
                     help="model the sequence similarity network was made with; names the default "
                          "network file, and a name containing 'blast' means the BLAST E-value file "
                          "(default: %(default)s)")
-    io.add_argument("--network", help="network HDF5 used to select homologs (default: "
+    io.add_argument("--network", help="network HDF5 used to select homologs (default: <data dir>/"
                                       "Networks_EValues/<sequence set>_[<network model>]_network.h5)")
-    io.add_argument("--out", help="output HDF5 (default: "
+    io.add_argument("--out", help="output HDF5 (default: <data dir>/"
                                   "Embeddings/<sequence set>_[E1_<mode>]_embeddings_speedup.h5)")
     gen = ap.add_argument_group("embedding generation")
     gen.add_argument("--mode", choices=["RA", "NORM"], default=EMBEDDING_MODE,
@@ -1564,26 +1571,27 @@ def parse_args(argv=None):
 
 
 def main(argv=None):
-    global SEQUENCE_SET, NETWORK_MODEL_NAME, INPUT_FASTA, INPUT_NETWORK_H5, EMBEDDING_MODE
+    global DATA_DIR, SEQUENCE_SET, NETWORK_MODEL_NAME, INPUT_FASTA, INPUT_NETWORK_H5, EMBEDDING_MODE
     global SAVING_MODE, OUTPUT_HDF5, MAX_SEQ_LENGTH, TOP_K_SEARCH, SELECTION_STRIDE, SCORE_MODE
     global NORMALIZATION_MODE, POOLING_METHOD, LENGTH_RATIO_POWER, SIMILARITY_MODEL_NAME
     global USE_ONLY_EMBEDDINGS, DEVICE
 
     args = parse_args(argv)
     # extract_homologs() reads these module settings, so they are set before it runs
+    DATA_DIR = args.data_dir
     SEQUENCE_SET = args.sequence_set
     NETWORK_MODEL_NAME = args.network_model
-    INPUT_FASTA = args.fasta or os.path.join("Sequence_Sets", f"{SEQUENCE_SET}.fasta")
+    INPUT_FASTA = args.fasta or os.path.join(DATA_DIR, "Sequence_Sets", f"{SEQUENCE_SET}.fasta")
     if args.network:
         INPUT_NETWORK_H5 = args.network
     elif "blast" in NETWORK_MODEL_NAME.lower():
-        INPUT_NETWORK_H5 = os.path.join("Networks_EValues", f"{SEQUENCE_SET}_[BLAST]_EValue.h5")
+        INPUT_NETWORK_H5 = os.path.join(DATA_DIR, "Networks_EValues", f"{SEQUENCE_SET}_[BLAST]_EValue.h5")
     else:
-        INPUT_NETWORK_H5 = os.path.join("Networks_EValues", f"{SEQUENCE_SET}_[{NETWORK_MODEL_NAME}]_network.h5")
+        INPUT_NETWORK_H5 = os.path.join(DATA_DIR, "Networks_EValues", f"{SEQUENCE_SET}_[{NETWORK_MODEL_NAME}]_network.h5")
     EMBEDDING_MODE = args.mode
     SAVING_MODE = args.precision
     OUTPUT_HDF5 = args.out or os.path.join(
-        "Embeddings", f"{SEQUENCE_SET}_[E1_{EMBEDDING_MODE}]_embeddings_speedup.h5")
+        DATA_DIR, "Embeddings", f"{SEQUENCE_SET}_[E1_{EMBEDDING_MODE}]_embeddings_speedup.h5")
     MAX_SEQ_LENGTH = args.max_seq_length
     TOP_K_SEARCH = args.top_k
     SELECTION_STRIDE = args.stride
@@ -1602,6 +1610,10 @@ def main(argv=None):
 
     print(f"--- Integrated E1 Embedding Generation [{EMBEDDING_MODE} Mode] ---")
     print(f"--> Precision: {SAVING_MODE}")
+    print(f"--> FASTA: {INPUT_FASTA}")
+    if EMBEDDING_MODE == "RA":
+        print(f"--> Network: {INPUT_NETWORK_H5}")
+    print(f"--> Output: {OUTPUT_HDF5}")
     try:
         generated_count = generate_embeddings(
             INPUT_FASTA,

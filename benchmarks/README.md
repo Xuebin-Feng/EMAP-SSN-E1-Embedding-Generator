@@ -13,14 +13,18 @@ machine:
   its own location.
 - **Outputs:** they go next to the scripts, in `benchmarks/<topic>/` and `benchmarks/logs/`.
   These folders are not tracked by git.
-- **Inputs:**
+- **Inputs**, which these scripts expect in the project folder itself:
   - `Sequence_Sets/Foldtype_IV_ATAs_13000.fasta`;
   - the ESMC 6B network `Networks_EValues/Foldtype_IV_ATAs_13000_[esmc_6b]_network.h5`;
   - for comparisons, the published embeddings
     `Embeddings/Foldtype_IV_ATAs_13000_[E1_RA]_embeddings.h5`, which is only ever opened
     read-only.
-  - Several scripts also use `benchmarks/homolog_map.json`, the homolog selection of every
-    query cached by `selection_determinism.py`.
+
+  If the data lives elsewhere, link the three folders into the project folder (git ignores
+  them): `ln -s /path/to/data/{Sequence_Sets,Networks_EValues,Embeddings} .`
+  (`--data-dir` and `E1_DATA_DIR` apply to the driver's command line only.)
+- **Homolog map:** several scripts also use `benchmarks/homolog_map.json`, the homolog
+  selection of every query. `check_ties.py` writes it; run that first.
 - **GPU scripts:** they need an otherwise idle GPU for meaningful timings.
 - **Scripts about the original code** (the "Original code" rows below) import
   `Generate_Embeddings_E1.py` and whichever `E1` package is installed. To reproduce the

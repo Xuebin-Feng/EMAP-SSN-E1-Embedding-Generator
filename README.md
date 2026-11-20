@@ -17,32 +17,37 @@ It is not affiliated with or endorsed by Profluent Bio.
 
 The first run creates `.venv` in this folder with [uv](https://docs.astral.sh/uv/) and installs
 the pinned packages: about 4 GB of downloads. If uv is missing, it is installed into
-`~/.local/bin`; your shell start-up files are not changed. `start.sh` then opens a shell with
-the environment active, so you can run the drivers as usual:
+`~/.local/bin`; your shell start-up files are not changed. `start.sh` then opens a shell in this
+folder with the environment active, so you can run the drivers as usual:
 
 ```bash
-python Generate_Embeddings_E1_fast.py                         # the configuration at the top of the file
-python Generate_Embeddings_E1_fast.py --sequence-set MySet --mode NORM
+python Generate_Embeddings_E1_fast.py --data-dir ~/my_data    # the configuration at the top of the file
+python Generate_Embeddings_E1_fast.py --data-dir ~/my_data --sequence-set MySet --mode NORM
 python Generate_Embeddings_E1_fast.py --help                  # all options and their defaults
 ```
 
-Every option defaults to the `CONFIGURATION` block at the top of the driver:
-- input and output: `--sequence-set`, `--fasta`, `--network-model`, `--network`, `--out`;
+**Where the data goes.** The data is not part of this repository. The driver reads and writes
+it in a data folder:
+- `<data dir>/Sequence_Sets/<set>.fasta`;
+- `<data dir>/Networks_EValues/<set>_[<network model>]_network.h5` (RA mode);
+- `<data dir>/Embeddings/<set>_[E1_<mode>]_embeddings_speedup.h5`, the output.
+
+The data folder is `--data-dir`, else the `E1_DATA_DIR` environment variable, else the current
+folder. After `export E1_DATA_DIR=~/my_data`, plain `python Generate_Embeddings_E1_fast.py` works.
+`--fasta`, `--network` and `--out` name single files directly.
+
+Every other option defaults to the `CONFIGURATION` block at the top of the driver:
+- input and output: `--sequence-set`, `--network-model`;
 - generation: `--mode`, `--precision`, `--bf16-speedups`;
 - homolog selection: `--max-homologs`, `--top-k`, `--stride`, …
-
-The default paths are built from the sequence-set name:
-- `Sequence_Sets/<set>.fasta`;
-- `Networks_EValues/<set>_[<network model>]_network.h5`;
-- `Embeddings/<set>_[E1_<mode>]_embeddings_speedup.h5`.
 
 An unfinished output file is resumed. Later runs of `start.sh` only check the environment,
 which takes about a second, and open the shell.
 
 | Command | What it does |
 | --- | --- |
-| `./start.sh` | Checks `.venv`, builds or repairs it if needed, then opens a shell in it. |
-| `./start.sh <command> ...` | The same, but runs the command in the environment instead of opening a shell. |
+| `./start.sh` | Checks `.venv`, builds or repairs it if needed, then opens a shell in it, in this folder. |
+| `./start.sh <command> ...` | The same, but runs the command in the environment instead of opening a shell. The command runs in the folder you called `start.sh` from, so relative paths in it are relative to that folder. |
 | `./start.sh --check-only` | Only reports: exit 0 if ready, 10 if setup is needed. With `--import`, it also imports torch, flash-attn and E1, which uses the GPU. |
 | `./start.sh --setup-only` | Builds or repairs `.venv`, then exits. |
 
